@@ -6,20 +6,26 @@ from typing import List, Dict, Optional
 import time
 import logging
 import json
+from googleapiclient.discovery import build
+from datetime import datetime
 
 class WebResearchTool:
-    def __init__(self, anthropic_api_key: str, max_urls: int = 5):
+    def __init__(self, anthropic_api_key: str, google_api_key: str, google_cse_id: str, max_urls: int = 5):
         """
-        Initialize the research tool with API key and configuration.
+        Initialize the research tool with API keys and configuration.
         
         Args:
             anthropic_api_key: Your Anthropic API key
+            google_api_key: Your Google Custom Search API key
+            google_cse_id: Your Google Custom Search Engine ID
             max_urls: Maximum number of URLs to process per research query
         """
         self.client = anthropic.Anthropic(api_key=anthropic_api_key)
+        self.google_api_key = google_api_key
+        self.google_cse_id = google_cse_id
         self.max_urls = max_urls
         self.setup_logging()
-    
+
     def setup_logging(self):
         """Configure logging for the tool."""
         logging.basicConfig(
@@ -27,6 +33,66 @@ class WebResearchTool:
             format='%(asctime)s - %(levelname)s - %(message)s'
         )
         self.logger = logging.getLogger(__name__)
+
+    def search_urls(self, query: str) -> List[Dict]:
+        """
+        Search for relevant URLs using Google Custom Search API.
+        
+        Args:
+            query: The search query
+            
+        Returns:
+            List of dictionaries containing URLs and metadata
+        """
+        try:
+            service = build("customsearch", "v1", developerKey=self.google_api_key)
+            result = service.cse().list(q=query, cx=self.google_cse_id, num=self.max_urls).execute()
+            
+            search_results = []
+            for item in result.get('items', []):
+                search_results.append({
+                    'url': item['link'],
+                    'title': item['title'],
+                    'snippet': item['snippet'],
+                    'source': urlparse(item['link']).netloc
+                })
+            
+            return search_results
+            
+        except Exception as e:
+            self.logger.error(f"Error in search: {str(e)}")
+            return []
+
+    def filter_urls(self, urls: List[Dict]) -> List[Dict]:
+        """
+        Filter URLs based on credibility and relevance.
+        
+        Args:
+            urls: List of URL dictionaries from search
+            
+        Returns:
+            Filtered list of URLs
+        """
+        # List of trusted domains (expand as needed)
+        trusted_domains = [
+            'nature.com', 'science.org', 'scientificamerican.com',
+            'ieee.org', 'acm.org', 'arxiv.org', 'gov', 'edu',
+            'github.com', 'stackoverflow.com', 'medium.com'
+        ]
+        
+        filtered_urls = []
+        for url_data in urls:
+            domain = urlparse(url_data['url']).netloc
+            
+            # Check if domain is trusted or ends with trusted suffix
+            is_trusted = any(
+                domain.endswith(trusted) for trusted in trusted_domains
+            )
+            
+            if is_trusted:
+                filtered_urls.append(url_data)
+        
+        return filtered_urls[:self.max_urls]
 
     def extract_text_from_url(self, url: str) -> Optional[str]:
         """
@@ -64,38 +130,43 @@ class WebResearchTool:
             self.logger.error(f"Error extracting content from {url}: {str(e)}")
             return None
 
-    def analyze_webpage(self, url: str, query: str) -> Dict:
+    def analyze_webpage(self, url_data: Dict, query: str) -> Dict:
         """
         Analyze a single webpage in the context of the research query.
         
         Args:
-            url: The URL to analyze
+            url_data: Dictionary containing URL and metadata
             query: The research query to consider
             
         Returns:
             Dictionary containing analysis results
         """
-        content = self.extract_text_from_url(url)
+        content = self.extract_text_from_url(url_data['url'])
         if not content:
-            return {"url": url, "error": "Failed to extract content"}
+            return {"url": url_data['url'], "error": "Failed to extract content"}
 
         # Truncate content if too long
-        max_content_length = 12000  # Adjust based on token limits
+        max_content_length = 12000
         if len(content) > max_content_length:
             content = content[:max_content_length] + "..."
 
         try:
             # Create analysis prompt
-            prompt = f"""For this webpage: {url}
-            Research query: {query}
+            prompt = f"""Analyze this webpage about "{query}":
+            
+            URL: {url_data['url']}
+            Title: {url_data['title']}
+            Source: {url_data['source']}
+            
             Content: {content}
             
-            Please analyze this content and provide:
-            1. A summary of relevant information (3-4 sentences)
+            Provide:
+            1. Summary of relevant information (3-4 sentences)
             2. Key findings related to the query
             3. Credibility assessment of the source
+            4. Publication date or recency (if available)
             
-            Format the response as JSON with these keys: summary, key_findings, credibility"""
+            Format as JSON with keys: summary, key_findings, credibility, date"""
 
             # Get response from Claude
             message = self.client.messages.create(
@@ -108,47 +179,57 @@ class WebResearchTool:
 
             # Parse JSON response
             analysis = json.loads(message.content[0].text)
-            analysis["url"] = url
+            analysis.update(url_data)  # Add URL metadata to analysis
             return analysis
 
         except Exception as e:
-            self.logger.error(f"Error analyzing {url}: {str(e)}")
-            return {"url": url, "error": str(e)}
+            self.logger.error(f"Error analyzing {url_data['url']}: {str(e)}")
+            return {"url": url_data['url'], "error": str(e)}
 
-    def research(self, query: str, urls: List[str]) -> Dict:
+    def research(self, query: str) -> Dict:
         """
-        Conduct research across multiple URLs for a given query.
+        Conduct automated research on a query.
         
         Args:
             query: The research topic or question
-            urls: List of URLs to analyze
             
         Returns:
             Dictionary containing compiled research results
         """
-        # Limit number of URLs
-        urls = urls[:self.max_urls]
+        # Search for relevant URLs
+        self.logger.info(f"Searching for relevant URLs for query: {query}")
+        search_results = self.search_urls(query)
+        
+        if not search_results:
+            return {"error": "No search results found"}
+        
+        # Filter URLs
+        filtered_urls = self.filter_urls(search_results)
+        
+        if not filtered_urls:
+            return {"error": "No reliable sources found"}
         
         # Analyze each URL
         analyses = []
-        for url in urls:
-            self.logger.info(f"Analyzing {url}")
-            analysis = self.analyze_webpage(url, query)
+        for url_data in filtered_urls:
+            self.logger.info(f"Analyzing {url_data['url']}")
+            analysis = self.analyze_webpage(url_data, query)
             analyses.append(analysis)
             time.sleep(1)  # Rate limiting
         
         # Compile findings
         synthesis_prompt = f"""Research query: {query}
         
-        Individual webpage analyses: {json.dumps(analyses, indent=2)}
+        Webpage analyses: {json.dumps(analyses, indent=2)}
         
-        Please synthesize these findings into:
-        1. Overall summary
+        Synthesize these findings into:
+        1. Comprehensive answer to the query
         2. Main conclusions
-        3. Areas needing further research
-        4. Credibility assessment of sources
+        3. Confidence level in findings
+        4. Areas needing more research
+        5. Most reliable sources found
         
-        Format response as JSON with these keys: summary, conclusions, gaps, source_assessment"""
+        Format as JSON with keys: answer, conclusions, confidence, gaps, best_sources"""
         
         try:
             # Get synthesis from Claude
@@ -165,6 +246,8 @@ class WebResearchTool:
             # Compile final results
             results = {
                 "query": query,
+                "timestamp": datetime.now().isoformat(),
+                "sources_analyzed": len(analyses),
                 "webpage_analyses": analyses,
                 "synthesis": synthesis
             }
@@ -175,28 +258,57 @@ class WebResearchTool:
             self.logger.error(f"Error synthesizing results: {str(e)}")
             return {
                 "query": query,
+                "timestamp": datetime.now().isoformat(),
+                "sources_analyzed": len(analyses),
                 "webpage_analyses": analyses,
                 "error": str(e)
             }
 
-# Example usage:
-if __name__ == "__main__":
-    API_KEY = ""
+def main():
+    """
+    Main function to run the research tool interactively.
+    """
+    # Load configuration
+    try:
+        with open('config.json', 'r') as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        print("Error: config.json not found. Please create it with your API keys.")
+        return
     
-    # Initialize tool
-    researcher = WebResearchTool(API_KEY)
+    # Initialize researcher
+    researcher = WebResearchTool(
+        anthropic_api_key=config['anthropic_api_key'],
+        google_api_key=config['google_api_key'],
+        google_cse_id=config['google_cse_id']
+    )
     
-    # Example research query
-    query = "What are the latest developments in SMR technology and development?"
-    urls = [
-        "https://www.iaea.org/newscenter/news/what-are-small-modular-reactors-smrs",
-        "https://world-nuclear.org/information-library/nuclear-fuel-cycle/nuclear-power-reactors/small-nuclear-power-reactors#:~:text=The%20International%20Atomic%20Energy%20Agency,those%20described%20do%20fit%20it.",
-        "https://c3newsmag.com/five-of-the-worlds-leading-small-modular-reactor-companies/"
-    ]
+    # Get query from user
+    query = input("\nEnter your research question: ")
+    
+    print("\nResearching... This may take a few minutes.")
     
     # Conduct research
-    results = researcher.research(query, urls)
+    results = researcher.research(query)
     
     # Save results
-    with open("research_results.json", "w") as f:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"research_results_{timestamp}.json"
+    
+    with open(filename, "w") as f:
         json.dump(results, f, indent=2)
+    
+    # Print summary
+    print("\nResearch Results Summary:")
+    print(f"Query: {query}")
+    print(f"Sources analyzed: {results.get('sources_analyzed', 0)}")
+    
+    if "synthesis" in results:
+        print("\nFindings:")
+        print(json.dumps(results["synthesis"], indent=2))
+        print(f"\nFull results saved to: {filename}")
+    else:
+        print("\nError:", results.get("error", "Unknown error"))
+
+if __name__ == "__main__":
+    main()
